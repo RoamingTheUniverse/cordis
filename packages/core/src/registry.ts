@@ -21,35 +21,65 @@ export type InjectKey = keyof {
   : never]: any;
 }
 
-// @Inject() 装饰器：用于在类或类方法上声明依赖注入。
-// - 作用于类：把依赖挂到类的 inject 原型链上（沿原型合并，checkProto 标记用于 resolve 时递归）。
-// - 作用于方法：把依赖记录到元数据，并在实例初始化时通过 ctx.inject 包裹方法调用。
+// @Inject() 装饰器工厂（基于 TC39 标准装饰器）：在「类」或「类方法」上声明依赖注入。
+// 注意它需要先被调用、返回的才是真正生效的装饰器：
+//   @Inject('database')          class Foo {}   // 类级：整个插件依赖该服务
+//   class Bar { @Inject('http') method() {} }   // 方法级：仅该方法执行时注入
+//
+// @param name    依赖的服务名，受 InjectKey 约束——必须是 Context 上「带 config 声明」的服务键。
+// @param config  可选的服务拦截配置；类型通过条件类型
+//                Context[K] extends { [symbols.config]: infer T } ? T : never
+//                从该服务的 config 声明中自动反推，使用方无需手写、保证类型安全。
+// @returns       标准装饰器函数 (value, decorator)，按 decorator.kind 分三类情况处理。
 export function Inject<K extends InjectKey>(
   name: K,
   config?: Context[K] extends { [symbols.config]: infer T } ? T : never,
 ) {
+  // value：被装饰的目标（类时为构造函数，方法时为方法函数）；decorator：装饰器上下文。
   return function (
     value: any,
     decorator: ClassDecoratorContext<any> | ClassMethodDecoratorContext<any>,
   ) {
+    // —— 场景一：装饰在「类」上 ——
     if (decorator.kind === 'class') {
+      // 仅当该类「自身」还没有 inject 时才初始化（首个 @Inject；
+      // 用 hasOwn 是为了排除从父类原型链继承到的 inject）。
       if (!Object.hasOwn(value, 'inject')) {
         defineProperty(
           value,
           'inject',
+          // 新建 inject 并把其原型指向父类的 inject（无父类则为 null）：
+          // 父类依赖经原型链天然继承，子类又可写同名键进行覆盖。
           Object.create(Object.getPrototypeOf(value).inject ?? null),
         )
+        // 打上 checkProto 标记：这是「装饰器产物」的身份证。
+        // 因为父类依赖藏在原型上、Object.keys 只列自身键，故 Inject.resolve 归一化时
+        // 需凭此标记沿原型链递归合并父类声明（普通对象形态的 inject 不带此标记、不应递归）。
         defineProperty(value.inject, symbols.checkProto, true)
       }
+      // 登记本依赖（config 为 undefined 时，会在 Inject.resolve 阶段统一回落为 null）。
       value.inject[name] = config
     } else if (decorator.kind === 'method') {
+      // —— 场景二：装饰在「方法」上 ——
+      // ① 把依赖写进方法自身的元数据 value[symbols.metadata].inject（无原型纯字典）。
+      //    用 ??= 逐级惰性创建 metadata / inject，使同一方法上叠加多个 @Inject 也只初始化一次。
       const inject = ((value[symbols.metadata] ??= {}).inject
         ??= Object.create(null))
       inject[name] = config
+      // ② addInitializer 注册「实例初始化器」：类被 new 时执行、this 绑定到新实例，
+      //    因此这里必须用普通 function 而非箭头函数。
       decorator.addInitializer(function () {
+        // 若实例带 tracker（典型为 Service 子类），property 即其上下文属性名（通常是 'ctx'）。
         const property = this[symbols.tracker]?.property;
+        // ③ 此刻仍处于构造期，this.ctx 尚未就绪，故只把「真正的注入动作」推入 initHooks，
+        //    交由 Fiber 在「实例 new 完之后、[symbols.init] 调用之前」统一执行（见 fiber.ts）。
         (this[symbols.initHooks] ??= []).push(() => {
+          // 声明依赖，待其就绪后回调，回调参数 ctx 是满足这些依赖的派生上下文。
           (this.ctx as Context).inject(inject, (ctx) => {
+            // 调用原始方法：
+            // - 有 tracker.property 时，用 withProps 造一个代理作为 this——读取 this[property]
+            //   时返回派生 ctx、其余属性仍透传给真实实例，使方法内 this.ctx 即带依赖的上下文；
+            // - 无 property 时直接以原实例为 this 调用。
             return value.call(
               property ? withProps(this, { [property]: ctx }) : this,
             )
@@ -57,31 +87,65 @@ export function Inject<K extends InjectKey>(
         })
       })
     } else {
+      // —— 其余装饰目标（字段 / getter / accessor 等）一律不支持 ——
       throw new Error('@Inject() can only be used on class or class methods')
     }
   }
 }
 
+// 与上方 function Inject 同名的命名空间：通过 TS 的「声明合并」机制，
+// 二者合体为「一个可直接调用、且身上挂着静态方法的函数」。
+// 调用侧既能 Inject(name)（装饰器工厂），也能 Inject.resolve(...)（工具方法）。
+//
+// 【本质：namespace 编译成 JS 后只是一个普通对象，并非独立的「类型盒子」】
+// namespace 里的成员分两类：interface/type 等纯类型编译时被完全擦除；
+// 而 export 的 function/const/class 等「值」会被真实保留，挂在命名空间对象上。
+// 上面这段 TS 编译（以 CommonJS 为例）大致产物如下——
+//
+//   function Inject(name) { return function (target) { } }
+//   // namespace 被编译成一个 IIFE：复用已有的 Inject，或先兜底建空对象
+//   (function (Inject) {
+//     function resolve(inject, result) { /* ... */ }
+//     Inject.resolve = resolve            // 方法 = 往 Inject 对象上挂属性
+//   })(Inject || (Inject = {}))
+//
+// 可见 `Inject.resolve` 在运行时就是函数对象 Inject 身上的一个普通属性，
+// 而「函数 + 同名 namespace」正好等价于「一个可调用、且自带工具箱的函数」（类比 $ 与 $.ajax）。
+//
+// 相比运行时 Inject.resolve = ... 的手动赋值，用 namespace 的关键优势在「类型层」：
+// 手动赋值要靠 TS 的流分析推断，仅在「顶层 + 紧邻 + 直赋」的窄场景生效，换个挂载位置
+// （如在另一个函数里挂载）类型就会丢失、导出的 .d.ts 里 resolve 直接消失；
+// namespace 则是语言级的声明合并，静态成员无条件存在、与挂载位置无关，还能同时收纳类型与值。
+// 因此它是 TS 表达「函数 + 配套工具箱」最可靠、最标准的方式。
 export namespace Inject {
-  // 把各种形态的 inject 声明归一化为「服务名 -> 配置」的字典：
-  // - 数组：值统一为 null（无额外配置）
-  // - 带 checkProto 标记的对象：先递归合并原型链上的声明，再覆盖自身键
-  // - 普通对象：直接展开键值
+  // 把各种形态的 inject 声明归一化为「服务名 -> 拦截配置」的字典。
+  // @param inject  原始声明：数组 / 带 checkProto 标记的对象 / 普通对象 / 空值
+  // @param result  累积结果，默认 Object.create(null)——无原型的纯字典，
+  //                 可避免与原型上的键（如 toString / hasOwnProperty）冲突，也更省内存。
+  //                 支持传入已有对象以便在其基础上继续合并。
+  // @returns        归一化后的「服务名 -> 配置」字典（值为 null 表示无额外配置）
   export function resolve(
     inject: Inject | null | undefined,
     result: Dict = Object.create(null),
   ) {
+    // 空声明（null/undefined）：直接返回（可能为空的）结果。
     if (!inject) return result
     if (Array.isArray(inject)) {
+      // 形态一「数组」：只声明依赖名、不带配置，统一把值置为 null。
       for (const name of inject) {
         result[name] = null
       }
     } else if (Reflect.has(inject, symbols.checkProto)) {
+      // 形态二「类继承链上的 inject」（由 @Inject 装饰器打上 checkProto 标记）：
+      // 先递归合并父类原型链上的声明作为基底，再用子类自身的键覆盖——
+      // 即「子类可继承并覆盖父类依赖配置」。注意是「先父后子」，保证自身优先生效。
       Object.assign(result, resolve(Object.getPrototypeOf(inject)))
       for (const name of Object.keys(inject)) {
+        // 显式传入 undefined 时回落为 null，与数组形态保持一致。
         result[name] = inject[name] ?? null
       }
     } else {
+      // 形态三「普通对象」：直接展开键值，无需处理原型链。
       for (const name of Object.keys(inject)) {
         result[name] = inject[name] ?? null
       }
@@ -132,13 +196,30 @@ export namespace Plugin {
     apply(ctx: Context, config: T): any
   }
 
-  // 运行时（Runtime）：同一个插件回调对应一份 runtime，聚合其所有 fiber 实例。
+  // 运行时（Runtime）：插件的「身份层」，与代表「某次加载」的 Fiber（实例层）相分离。
+  //
+  // 设计动机：同一个插件可能被加载多次（不同 config、挂在不同父上下文、面对不同依赖环境），
+  // 每次加载各需一个独立 Fiber；但插件自身的身份信息（回调、名字、配置 schema）始终是同一份，
+  // 无需重复存储。因此按「一个插件回调对应一份 runtime」做归一化，用 runtime 聚合它的全部 fiber。
+  //
+  // 数量关系：一个插件 ↔ 一份 Runtime ↔ 多个 Fiber（类似「程序镜像 ↔ 多个运行进程」）。
+  // runtime 以 callback 为 key 存于 RegistryService 的内部 Map 中，由此：
+  // - has/get/delete 的语义天然作用于「整个插件」而非某次实例；
+  // - 最后一个 fiber 注销时，runtime 会自动从注册表删除（引用计数式回收，见 fiber.ts）。
   export interface Runtime {
+    // 插件名，用于日志与调试；所有 fiber 共享，fiber.name 会兜底取此值。
+    // 可能为空（匿名插件，或名字被启发式清空的情况，见 RegistryService.plugin）。
     name?: string
-    // 该 runtime 下所有的 fiber（同一插件可被多次加载）
+    // 该 runtime 下所有存活的 fiber：同一插件可被加载多次，各自独立。
+    // fiber 加载时把自身 push 进来、销毁时自动移除；列表是遍历卸载（registry.delete）
+    // 与判断「runtime 是否还被引用」的依据。
     fibers: DisposableList<Fiber>
-    // 归一化后的插件回调
+    // 归一化后的插件回调：既是该插件的唯一身份标识（Map 的 key），也是执行入口。
+    // 函数/类插件为插件自身，对象插件为其 apply 方法；真正执行时再用 isConstructor 区分
+    // 「直接调用」还是「new 实例化」。
     callback: globalThis.Function
+    // 插件可选声明的配置 schema（StandardSchemaV1），所有 fiber 共享。
+    // fiber 加载时由 resolveConfig 用它校验/规范化 config；缺省表示不校验、原样透传。
     Config?: StandardSchemaV1
   }
 }
